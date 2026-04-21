@@ -46,9 +46,11 @@ runs:
     - name: Configure Snowflake auth
       if: inputs.snowflake-config != ''
       shell: bash
+      env:
+        SNOWFLAKE_CONFIG_CONTENT: ${{ inputs.snowflake-config }}
       run: |
         mkdir -p ~/.snowflake
-        echo "${{ inputs.snowflake-config }}" > ~/.snowflake/connections.toml
+        printf '%s\n' "$SNOWFLAKE_CONFIG_CONTENT" > ~/.snowflake/connections.toml
         chmod 600 ~/.snowflake/connections.toml
         # Also create config.toml pointing to the default connection
         CONN_NAME=$(python3 -c "
