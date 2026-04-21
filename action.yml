@@ -1,0 +1,89 @@
+name: 'Code Healer'
+description: 'Automatically fix bugs from GitHub issues using Cortex Code Agent SDK'
+author: 'jamescha-earley'
+
+inputs:
+  issue-number:
+    description: 'GitHub issue number to fix'
+    required: true
+  snowflake-connection:
+    description: 'Snowflake connection name (optional, for SQL-related bugs)'
+    required: false
+    default: ''
+  cortex-version:
+    description: 'Cortex Code CLI version channel'
+    required: false
+    default: 'beta'
+  dry-run:
+    description: 'If true, fix code but skip PR creation'
+    required: false
+    default: 'false'
+
+outputs:
+  pr-url:
+    description: 'URL of the created pull request'
+    value: ${{ steps.heal.outputs.pr-url }}
+  status:
+    description: 'Outcome: success, no-changes, or failed'
+    value: ${{ steps.heal.outputs.status }}
+  confidence:
+    description: 'Agent confidence in the fix: high, medium, or low'
+    value: ${{ steps.heal.outputs.confidence }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Cortex Code CLI
+      shell: bash
+      run: |
+        curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | CORTEX_CHANNEL=${{ inputs.cortex-version }} sh
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: Install Python SDK
+      shell: bash
+      run: |
+        pip install cortex-code-agent-sdk
+
+    - name: Run Code Healer
+      id: heal
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        ISSUE_URL: ${{ github.server_url }}/${{ github.repository }}/issues/${{ inputs.issue-number }}
+      run: |
+        cd ${{ github.action_path }}
+
+        ARGS="--issue $ISSUE_URL --ci"
+        if [ -n "${{ inputs.snowflake-connection }}" ]; then
+          ARGS="$ARGS --connection ${{ inputs.snowflake-connection }}"
+        fi
+        if [ "${{ inputs.dry-run }}" = "true" ]; then
+          ARGS="$ARGS --dry-run"
+        fi
+
+        python heal.py $ARGS
+
+    - name: Comment on issue
+      if: always()
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        STATUS="${{ steps.heal.outputs.status }}"
+        PR_URL="${{ steps.heal.outputs.pr-url }}"
+        ISSUE="${{ inputs.issue-number }}"
+        REPO="${{ github.repository }}"
+        CONFIDENCE="${{ steps.heal.outputs.confidence }}"
+
+        if [ "$STATUS" = "success" ]; then
+          BODY="**Code Healer** created a fix: ${PR_URL}\n\nConfidence: **${CONFIDENCE}**\n\n_Automated by [Code Healer](${PR_URL})_"
+        elif [ "$STATUS" = "no-changes" ]; then
+          BODY="**Code Healer** analyzed this issue but could not produce a code fix.\n\n_The agent ran but no file changes were made. A human may need to investigate._"
+        else
+          BODY="**Code Healer** failed to fix this issue.\n\n_Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details._"
+        fi
+
+        gh issue comment "$ISSUE" --repo "$REPO" --body "$(echo -e "$BODY")"
+
+        # Remove the heal label to prevent re-triggers
+        gh issue edit "$ISSUE" --repo "$REPO" --remove-label "heal" || true

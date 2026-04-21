@@ -1,0 +1,53 @@
+# Code Healer -- Auto-fix bugs on label
+#
+# Copy this file to .github/workflows/heal.yml in your repo.
+# When someone adds the "heal" label to an issue, this workflow:
+#   1. Checks out your code
+#   2. Runs the Code Healer agent to analyze and fix the bug
+#   3. Creates a PR with the fix
+#   4. Comments on the issue with the result
+#
+# Prerequisites:
+#   - The "heal" label must exist in your repo
+#   - Cortex Code CLI must be able to authenticate (via SNOWFLAKE_TOKEN secret or default auth)
+#   - The GITHUB_TOKEN needs write access to issues and pull requests (default for Actions)
+
+name: Code Healer
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  heal:
+    # Only run when the "heal" label is added
+    if: github.event.label.name == 'heal'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Code Healer
+        uses: jamescha-earley/code-healer@main
+        id: healer
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          # Uncomment if your bugs involve Snowflake:
+          # snowflake-connection: ${{ secrets.SNOWFLAKE_CONNECTION }}
+
+      - name: Summary
+        run: |
+          echo "### Code Healer Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ steps.healer.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **PR**: ${{ steps.healer.outputs.pr-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Confidence**: ${{ steps.healer.outputs.confidence }}" >> $GITHUB_STEP_SUMMARY
