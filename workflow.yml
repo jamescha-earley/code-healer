@@ -9,7 +9,7 @@
 #
 # Prerequisites:
 #   - The "heal" label must exist in your repo
-#   - Cortex Code CLI must be able to authenticate (via SNOWFLAKE_TOKEN secret or default auth)
+#   - SNOWFLAKE_CONFIG repo secret must contain a valid connections.toml for Cortex CLI auth
 #   - The GITHUB_TOKEN needs write access to issues and pull requests (default for Actions)
 
 name: Code Healer
@@ -42,8 +42,7 @@ jobs:
         id: healer
         with:
           issue-number: ${{ github.event.issue.number }}
-          # Uncomment if your bugs involve Snowflake:
-          # snowflake-connection: ${{ secrets.SNOWFLAKE_CONNECTION }}
+          snowflake-config: ${{ secrets.SNOWFLAKE_CONFIG }}
 
       - name: Summary
         run: |

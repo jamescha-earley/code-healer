@@ -14,6 +14,10 @@ inputs:
     description: 'Cortex Code CLI version channel'
     required: false
     default: 'beta'
+  snowflake-config:
+    description: 'Full contents of connections.toml for Snowflake auth (store as a GitHub secret)'
+    required: false
+    default: ''
   dry-run:
     description: 'If true, fix code but skip PR creation'
     required: false
@@ -38,6 +42,14 @@ runs:
       run: |
         curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | CORTEX_CHANNEL=${{ inputs.cortex-version }} sh
         echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+    - name: Configure Snowflake auth
+      if: inputs.snowflake-config != ''
+      shell: bash
+      run: |
+        mkdir -p ~/.snowflake
+        echo "${{ inputs.snowflake-config }}" > ~/.snowflake/connections.toml
+        chmod 600 ~/.snowflake/connections.toml
 
     - name: Install Python SDK
       shell: bash
