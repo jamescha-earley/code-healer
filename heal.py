@@ -247,6 +247,15 @@ def submit_pr(
 
     # Push and create PR
     branch = f"fix/issue-{issue_number}"
+
+    # In CI, configure git credentials for push using GITHUB_TOKEN
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if github_token:
+        subprocess.run(
+            ["git", "remote", "set-url", "origin", f"https://x-access-token:{github_token}@github.com/{owner}/{repo}.git"],
+            cwd=repo_dir, check=True, capture_output=True,
+        )
+
     push_result = subprocess.run(
         ["git", "push", "-u", "--force", "origin", f"HEAD:{branch}"],
         cwd=repo_dir, capture_output=True, text=True,
