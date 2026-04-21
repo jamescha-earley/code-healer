@@ -247,10 +247,13 @@ def submit_pr(
 
     # Push and create PR
     branch = f"fix/issue-{issue_number}"
-    subprocess.run(
-        ["git", "push", "-u", "origin", branch],
-        cwd=repo_dir, check=True, capture_output=True, text=True,
+    push_result = subprocess.run(
+        ["git", "push", "-u", "--force", "origin", f"HEAD:{branch}"],
+        cwd=repo_dir, capture_output=True, text=True,
     )
+    if push_result.returncode != 0:
+        print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
+        raise subprocess.CalledProcessError(push_result.returncode, push_result.args, push_result.stdout, push_result.stderr)
 
     pr_body = report.get("pr_body", f"Fixes #{issue_number}")
     pr_title = report.get("pr_title", f"Fix #{issue_number}")
@@ -260,10 +263,22 @@ def submit_pr(
             "gh", "pr", "create",
             "--title", pr_title,
             "--body", pr_body,
+            "--head", branch,
             "--repo", f"{owner}/{repo}",
         ],
-        cwd=repo_dir, capture_output=True, text=True, check=True,
+        cwd=repo_dir, capture_output=True, text=True,
     )
+    if result.returncode != 0:
+        # PR may already exist for this branch -- try to find it
+        if "already exists" in result.stderr:
+            find = subprocess.run(
+                ["gh", "pr", "view", branch, "--repo", f"{owner}/{repo}", "--json", "url", "--jq", ".url"],
+                capture_output=True, text=True,
+            )
+            if find.stdout.strip():
+                return find.stdout.strip()
+        print(f"  PR creation failed: {result.stderr.strip()}", file=sys.stderr)
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
     pr_url = result.stdout.strip()
     return pr_url
 
