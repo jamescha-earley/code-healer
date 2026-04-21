@@ -1,14 +1,13 @@
-# Code Healer -- Auto-fix bugs on label
+# Code Healer -- Auto-fix bugs on new issues
 #
 # Copy this file to .github/workflows/heal.yml in your repo.
-# When someone adds the "heal" label to an issue, this workflow:
+# When a new issue is opened, this workflow:
 #   1. Checks out your code
 #   2. Runs the Code Healer agent to analyze and fix the bug
 #   3. Creates a PR with the fix
 #   4. Comments on the issue with the result
 #
 # Prerequisites:
-#   - The "heal" label must exist in your repo
 #   - SNOWFLAKE_CONFIG repo secret must contain a valid connections.toml for Cortex CLI auth
 #   - The GITHUB_TOKEN needs write access to issues and pull requests (default for Actions)
 
@@ -16,12 +15,10 @@ name: Code Healer
 
 on:
   issues:
-    types: [labeled]
+    types: [opened]
 
 jobs:
   heal:
-    # Only run when the "heal" label is added
-    if: github.event.label.name == 'heal'
     runs-on: ubuntu-latest
     permissions:
       contents: write
