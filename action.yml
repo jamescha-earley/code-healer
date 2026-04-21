@@ -50,6 +50,16 @@ runs:
         mkdir -p ~/.snowflake
         echo "${{ inputs.snowflake-config }}" > ~/.snowflake/connections.toml
         chmod 600 ~/.snowflake/connections.toml
+        # Also create config.toml pointing to the default connection
+        CONN_NAME=$(python3 -c "
+        import tomllib
+        with open('$HOME/.snowflake/connections.toml', 'rb') as f:
+            c = tomllib.load(f)
+        print(c.get('default_connection_name', ''))
+        ")
+        if [ -n "$CONN_NAME" ]; then
+          echo "default_connection_name = \"$CONN_NAME\"" > ~/.snowflake/config.toml
+        fi
 
     - name: Install Python SDK
       shell: bash

@@ -43,6 +43,7 @@ jobs:
         with:
           issue-number: ${{ github.event.issue.number }}
           snowflake-config: ${{ secrets.SNOWFLAKE_CONFIG }}
+          snowflake-connection: devrel
 
       - name: Summary
         run: |
