@@ -218,6 +218,12 @@ def submit_pr(
         print("  No file changes detected -- nothing to commit.", file=sys.stderr)
         return None
 
+    # Ensure git identity is configured (needed in CI)
+    for key, val in [("user.name", "Code Healer"), ("user.email", "code-healer[bot]@users.noreply.github.com")]:
+        check = subprocess.run(["git", "config", key], cwd=repo_dir, capture_output=True, text=True)
+        if not check.stdout.strip():
+            subprocess.run(["git", "config", key, val], cwd=repo_dir, check=True, capture_output=True)
+
     # Stage and commit
     subprocess.run(
         ["git", "add", "-A"],
