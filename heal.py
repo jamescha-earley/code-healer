@@ -239,6 +239,10 @@ def submit_pr(
     if not status.stdout.strip():
         return None
 
+    # Ensure git identity is configured (required in CI)
+    subprocess.run(["git", "config", "user.name", "code-healer[bot]"], cwd=repo_dir, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "code-healer[bot]@users.noreply.github.com"], cwd=repo_dir, capture_output=True)
+
     subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
 
     title = (report or {}).get("pr_title", f"Fix issue #{issue_number}")
