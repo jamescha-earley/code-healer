@@ -111,14 +111,6 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],
         "models": {"orchestration": "claude-sonnet-4-5"},
-        "tools": [
-            {"tool_spec": {"type": "code_toolset_all", "name": "code_toolset_all"}}
-        ],
-        "tool_resources": {
-            "code_toolset_all": {
-                "permission_policy": {"type": "always_allow"}
-            }
-        }
     }
 
     headers = {
