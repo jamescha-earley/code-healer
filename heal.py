@@ -130,13 +130,17 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
 
     full_text = []
     line_count = 0
+    current_event_type = None
+    event_types_seen = set()
     for line in response.iter_lines(decode_unicode=True):
         if not line:
             continue
         line_count += 1
-        # Debug: print first 10 raw SSE lines
-        if line_count <= 10:
-            print(f"  [SSE line {line_count}]: {line[:200]}", file=sys.stderr)
+        # Track SSE event type
+        if line.startswith("event: "):
+            current_event_type = line[7:]
+            event_types_seen.add(current_event_type)
+            continue
         if not line.startswith("data: "):
             continue
         data = line[6:]
@@ -144,24 +148,26 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
             break
         try:
             event = json.loads(data)
-            text = extract_text(event)
-            if text:
+            text = event.get("text", "")
+            if text and current_event_type != "response.status":
                 full_text.append(text)
                 if not json_only:
                     print(text, end="", flush=True)
         except json.JSONDecodeError:
-            if line_count <= 10:
-                print(f"  [SSE parse error]: {data[:100]}", file=sys.stderr)
             continue
 
-    print(f"\n  [Debug] Total SSE lines: {line_count}, text chunks: {len(full_text)}", file=sys.stderr)
+    print(f"\n  [Debug] SSE lines: {line_count}, text chunks: {len(full_text)}, event types: {event_types_seen}", file=sys.stderr)
 
     conn.close()
     return "".join(full_text)
 
 
 def extract_text(event: dict) -> str:
-    """Extract printable text from an SSE event."""
+    """Extract printable text from an SSE event (Cortex agent:run format)."""
+    # Direct text field (response.content_part.delta and response.thinking.delta)
+    if "text" in event:
+        return event["text"]
+    # Nested delta format
     if "delta" in event:
         delta = event["delta"]
         if isinstance(delta, dict):
@@ -170,6 +176,7 @@ def extract_text(event: dict) -> str:
             inner = delta.get("delta", {})
             if isinstance(inner, dict) and "text" in inner:
                 return inner["text"]
+    # Content blocks
     content = event.get("content", [])
     if isinstance(content, list):
         for block in content:
