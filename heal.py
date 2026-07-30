@@ -1,51 +1,26 @@
-#!/usr/bin/env python3
 """Code Healer -- automated bug fixing from GitHub issues.
 
-Takes a GitHub issue URL, analyzes the codebase, fixes the bug, and
-submits a PR with a detailed description.
+Calls the Snowflake Managed Agents API (code_toolset_all) to investigate
+and fix bugs. The agent runs server-side in Snowflake's managed sandbox --
+no CLI install, no local containers. Just a REST call.
 
 Usage:
     python heal.py --issue https://github.com/org/repo/issues/123
-    python heal.py --issue https://github.com/org/repo/issues/123 --json
-    python heal.py --issue https://github.com/org/repo/issues/123 --dry-run
+    python heal.py --issue https://github.com/org/repo/issues/42 --dry-run
+    python heal.py --issue https://github.com/org/repo/issues/42 --json
 """
 
 import argparse
-import asyncio
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
-from cortex_code_agent_sdk import (
-    AssistantMessage,
-    CortexCodeAgentOptions,
-    HookMatcher,
-    PermissionResultAllow,
-    ResultMessage,
-    SystemMessage,
-    TaskProgressMessage,
-    query,
-)
-
-from agents import get_agents
-from prompts import get_system_prompt
-from schemas import PR_REPORT_SCHEMA
-
-# Audit: every file edit the agent makes
-edit_log: list[dict] = []
-
-
-def gha_output(name: str, value: str) -> None:
-    """Write a GitHub Actions output variable."""
-    output_file = os.environ.get("GITHUB_OUTPUT")
-    if output_file:
-        with open(output_file, "a") as f:
-            f.write(f"{name}={value}\n")
+import requests
+import snowflake.connector
 
 
 def parse_issue_url(url: str) -> tuple[str, str, int]:
@@ -73,323 +48,303 @@ def fetch_issue(owner: str, repo: str, number: int) -> dict:
 
 
 def prepare_repo(owner: str, repo: str, issue_number: int) -> Path:
-    """Clone the repo and create a fix branch. Returns the repo path."""
+    """Clone the repo and create a fix branch."""
     repo_dir = Path(tempfile.mkdtemp(prefix=f"heal-{repo}-{issue_number}-"))
     print(f"  Cloning {owner}/{repo} into {repo_dir}...")
-
     subprocess.run(
         ["gh", "repo", "clone", f"{owner}/{repo}", str(repo_dir), "--", "--depth=50"],
         check=True, capture_output=True, text=True,
     )
-
     branch = f"fix/issue-{issue_number}"
     subprocess.run(
         ["git", "checkout", "-b", branch],
         cwd=repo_dir, check=True, capture_output=True, text=True,
     )
-    print(f"  Branch: {branch}")
     return repo_dir
 
 
-async def auto_approve(tool_name, tool_input, context):
-    """Auto-approve all tool calls."""
-    return PermissionResultAllow(behavior="allow")
+def upload_to_workspace(repo_dir: Path, workspace: str, connection: str) -> None:
+    """Upload repo files to a Snowflake workspace for the managed agent."""
+    print(f"  Uploading repo to workspace {workspace}:/heal/ ...")
+    for f in repo_dir.rglob("*"):
+        if f.is_file() and ".git" not in f.parts:
+            rel = f.relative_to(repo_dir)
+            dest = f"{workspace}:/heal/{rel.parent}/" if str(rel.parent) != "." else f"{workspace}:/heal/"
+            subprocess.run(
+                ["cortex", "ws", "cp", str(f), dest, "-c", connection],
+                capture_output=True, text=True,
+            )
 
 
-async def edit_audit_hook(hook_input, tool_use_id, context):
-    """PostToolUse hook that logs file edits."""
-    if isinstance(hook_input, dict):
-        tool_name = hook_input.get("tool_name", "")
-        tool_input = hook_input.get("tool_input", {})
-        if isinstance(tool_input, dict):
-            file_path = tool_input.get("file_path") or tool_input.get("path")
-            if file_path:
-                edit_log.append({
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "tool": tool_name,
-                    "file": file_path,
-                    "tool_use_id": tool_use_id,
-                })
-    return {}
+def download_from_workspace(repo_dir: Path, workspace: str, connection: str) -> None:
+    """Download fixed files back from workspace."""
+    # List all files in workspace heal dir and download them
+    result = subprocess.run(
+        ["cortex", "ws", "ls", f"{workspace}:/heal/", "-c", connection, "--json"],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        try:
+            files = json.loads(result.stdout)
+            for entry in files.get("items", []):
+                name = entry.get("name", "")
+                if name:
+                    local_path = repo_dir / name.lstrip("/")
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(
+                        ["cortex", "ws", "cp", f"{workspace}:/heal/{name}", str(local_path.parent) + "/", "-c", connection],
+                        capture_output=True, text=True,
+                    )
+        except json.JSONDecodeError:
+            pass
 
 
-async def run_healer(
-    issue: dict,
-    issue_number: int,
-    repo_dir: Path,
-    connection: str | None,
-    json_only: bool,
+def call_managed_agent(
+    connection_name: str,
+    workspace: str,
+    prompt: str,
+    json_only: bool = False,
 ) -> dict | None:
-    """Run the healer agent and return the structured PR report."""
-    labels = issue.get("labels", [])
-    system_prompt = get_system_prompt(
-        issue_title=issue["title"],
-        issue_body=issue.get("body") or "(no description)",
-        issue_number=issue_number,
-        labels=labels,
-    )
+    """Call the Managed Agents API with code_toolset_all."""
+    conn = snowflake.connector.connect(connection_name=connection_name)
+    token = conn.rest.token
+    account_url = f"https://{conn.host}"
+    url = f"{account_url}/api/v2/cortex/agent:run"
 
-    prompt = (
-        f"Fix the bug described in issue #{issue_number}: {issue['title']}\n\n"
-        f"The repository is cloned at {repo_dir}. "
-        f"Use your team to investigate, fix, and review the changes."
-    )
-
-    options = CortexCodeAgentOptions(
-        cwd=str(repo_dir),
-        system_prompt=system_prompt,
-        output_format=PR_REPORT_SCHEMA,
-        max_turns=40,
-        agents=get_agents(),
-        can_use_tool=auto_approve,
-        hooks={
-            "PostToolUse": [
-                HookMatcher(
-                    matcher="Edit|Write|MultiEdit",
-                    hooks=[edit_audit_hook],
-                )
-            ],
+    payload = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": prompt}]}
+        ],
+        "models": {"orchestration": "claude-sonnet-4-5"},
+        "instructions": {
+            "system": (
+                "You are a bug-fixing agent. Investigate the codebase, identify the root cause, "
+                "apply the minimal fix, and run tests to verify. Be thorough but concise. "
+                "After fixing, provide a JSON summary with keys: pr_title, pr_body, root_cause, confidence."
+            )
         },
-    )
-    if connection:
-        options.connection = connection
+        "tools": [
+            {"tool_spec": {"type": "code_toolset_all", "name": "code_toolset_all"}}
+        ],
+        "tool_resources": {
+            "code_toolset_all": {
+                "permission_policy": {"type": "always_allow"},
+                "workspace_mounts": [
+                    {"name": workspace, "type": "workspace", "mount_path": "/workspace"}
+                ]
+            }
+        }
+    }
 
-    report = None
+    headers = {
+        "Authorization": f"Snowflake Token=\"{token}\"",
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+    }
 
-    if not json_only:
-        print(f"\n{'='*60}")
-        print(f"  CODE HEALER: #{issue_number} -- {issue['title']}")
-        print(f"  Repo: {repo_dir}")
-        print(f"{'='*60}\n")
+    response = requests.post(url, json=payload, headers=headers, stream=True)
 
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            if not json_only:
-                for block in message.content:
-                    if hasattr(block, "text"):
-                        print(block.text, end="")
-                    elif hasattr(block, "name"):
-                        print(f"\n  [tool] {block.name}", end="")
+    if response.status_code != 200:
+        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        return None
 
-        elif isinstance(message, TaskProgressMessage):
-            if not json_only:
-                desc = getattr(message, "description", "")
-                if desc:
-                    print(f"\n  [agent] {desc}", end="")
-
-        elif isinstance(message, ResultMessage):
-            if not json_only:
-                print(f"\n\n{'='*60}")
-                print(f"  Healing complete.")
-                duration = getattr(message, "duration_ms", None)
-                if duration:
-                    print(f"  Duration: {duration / 1000:.1f}s")
-                print(f"  Files edited: {len(edit_log)}")
-                print(f"{'='*60}")
-
-            if message.structured_output:
-                report = message.structured_output
+    full_text = []
+    for line in response.iter_lines(decode_unicode=True):
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
             break
+        try:
+            event = json.loads(data)
+            text = extract_text(event)
+            if text:
+                full_text.append(text)
+                if not json_only:
+                    print(text, end="", flush=True)
+        except json.JSONDecodeError:
+            continue
 
-        elif isinstance(message, SystemMessage):
-            if not json_only:
-                subtype = getattr(message, "subtype", "")
-                if subtype and subtype not in ("init",):
-                    print(f"\n  [system] {subtype}", end="")
+    conn.close()
 
+    # Try to extract structured report from agent output
+    combined = "".join(full_text)
+    report = extract_json_report(combined)
     return report
 
 
+def extract_text(event: dict) -> str:
+    """Extract printable text from an SSE event."""
+    if "delta" in event:
+        delta = event["delta"]
+        if isinstance(delta, dict):
+            if "text" in delta:
+                return delta["text"]
+            inner = delta.get("delta", {})
+            if isinstance(inner, dict) and "text" in inner:
+                return inner["text"]
+    content = event.get("content", [])
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block["text"]
+    return ""
+
+
+def extract_json_report(text: str) -> dict | None:
+    """Try to find a JSON object with pr_title in the agent output."""
+    # Look for JSON blocks
+    for match in re.finditer(r'\{[^{}]*"pr_title"[^{}]*\}', text, re.DOTALL):
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            continue
+    # Try code-fenced JSON
+    for match in re.finditer(r'```json?\s*\n(.*?)\n```', text, re.DOTALL):
+        try:
+            obj = json.loads(match.group(1))
+            if "pr_title" in obj:
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def submit_pr(
-    repo_dir: Path,
-    owner: str,
-    repo: str,
-    issue_number: int,
-    report: dict,
-    dry_run: bool,
+    repo_dir: Path, owner: str, repo: str, issue_number: int,
+    report: dict | None, dry_run: bool,
 ) -> str | None:
-    """Commit changes and create the PR. Returns PR URL or None."""
-    # Check if there are actual changes
+    """Commit changes and create a PR."""
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=repo_dir, capture_output=True, text=True,
     )
     if not status.stdout.strip():
-        print("  No file changes detected -- nothing to commit.", file=sys.stderr)
+        print("  No file changes detected.", file=sys.stderr)
         return None
 
-    # Ensure git identity is configured (needed in CI)
-    for key, val in [("user.name", "Code Healer"), ("user.email", "code-healer[bot]@users.noreply.github.com")]:
-        check = subprocess.run(["git", "config", key], cwd=repo_dir, capture_output=True, text=True)
-        if not check.stdout.strip():
-            subprocess.run(["git", "config", key, val], cwd=repo_dir, check=True, capture_output=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
 
-    # Stage and commit
+    title = (report or {}).get("pr_title", f"Fix issue #{issue_number}")
     subprocess.run(
-        ["git", "add", "-A"],
-        cwd=repo_dir, check=True, capture_output=True,
-    )
-
-    commit_msg = f"fix: {report.get('pr_title', f'Fix issue #{issue_number}')}\n\nCloses #{issue_number}"
-    subprocess.run(
-        ["git", "commit", "-m", commit_msg],
+        ["git", "commit", "-m", f"fix: {title}\n\nCloses #{issue_number}"],
         cwd=repo_dir, check=True, capture_output=True, text=True,
     )
 
     if dry_run:
         print("\n  [dry-run] Skipping push and PR creation.")
-        diff = subprocess.run(
-            ["git", "diff", "HEAD~1"],
-            cwd=repo_dir, capture_output=True, text=True,
-        )
-        print(diff.stdout[:3000])
         return None
 
-    # Push and create PR
     branch = f"fix/issue-{issue_number}"
-
-    # In CI, configure git credentials for push using GITHUB_TOKEN
     github_token = os.environ.get("GITHUB_TOKEN")
     if github_token:
         subprocess.run(
-            ["git", "remote", "set-url", "origin", f"https://x-access-token:{github_token}@github.com/{owner}/{repo}.git"],
+            ["git", "remote", "set-url", "origin",
+             f"https://x-access-token:{github_token}@github.com/{owner}/{repo}.git"],
             cwd=repo_dir, check=True, capture_output=True,
         )
 
-    push_result = subprocess.run(
+    subprocess.run(
         ["git", "push", "-u", "--force", "origin", f"HEAD:{branch}"],
-        cwd=repo_dir, capture_output=True, text=True,
+        cwd=repo_dir, check=True, capture_output=True, text=True,
     )
-    if push_result.returncode != 0:
-        print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
-        raise subprocess.CalledProcessError(push_result.returncode, push_result.args, push_result.stdout, push_result.stderr)
 
-    pr_body = report.get("pr_body", f"Fixes #{issue_number}")
-    pr_title = report.get("pr_title", f"Fix #{issue_number}")
-
+    pr_body = (report or {}).get("pr_body", f"Fixes #{issue_number}")
     result = subprocess.run(
-        [
-            "gh", "pr", "create",
-            "--title", pr_title,
-            "--body", pr_body,
-            "--head", branch,
-            "--repo", f"{owner}/{repo}",
-        ],
+        ["gh", "pr", "create", "--title", title, "--body", pr_body,
+         "--head", branch, "--repo", f"{owner}/{repo}"],
         cwd=repo_dir, capture_output=True, text=True,
     )
     if result.returncode != 0:
-        # PR may already exist for this branch -- try to find it
         if "already exists" in result.stderr:
             find = subprocess.run(
                 ["gh", "pr", "view", branch, "--repo", f"{owner}/{repo}", "--json", "url", "--jq", ".url"],
                 capture_output=True, text=True,
             )
-            if find.stdout.strip():
-                return find.stdout.strip()
-        print(f"  PR creation failed: {result.stderr.strip()}", file=sys.stderr)
-        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
-    pr_url = result.stdout.strip()
-    return pr_url
+            return find.stdout.strip() if find.stdout.strip() else None
+        return None
+    return result.stdout.strip()
+
+
+def gha_output(name: str, value: str) -> None:
+    """Write a GitHub Actions output."""
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        with open(output_file, "a") as f:
+            f.write(f"{name}={value}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Code Healer -- fix bugs from GitHub issues using Cortex Code Agent SDK"
-    )
-    parser.add_argument(
-        "--issue", required=True,
-        help="GitHub issue URL (e.g. https://github.com/org/repo/issues/123)",
-    )
-    parser.add_argument(
-        "--connection", default=None,
-        help="Snowflake connection name (optional, for SQL-related bugs)",
-    )
-    parser.add_argument(
-        "--json", action="store_true", dest="json_only",
-        help="Output only the structured JSON report",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="Fix the code but don't push or create PR",
-    )
-    parser.add_argument(
-        "--repo-dir", default=None,
-        help="Use existing repo directory instead of cloning",
-    )
-    parser.add_argument(
-        "--ci", action="store_true",
-        help="CI mode: write GitHub Actions outputs (pr-url, status, confidence)",
-    )
-
+    parser = argparse.ArgumentParser(description="Code Healer — fix bugs via Managed Agents API")
+    parser.add_argument("--issue", required=True, help="GitHub issue URL")
+    parser.add_argument("--connection", default="devrel", help="Snowflake connection name")
+    parser.add_argument("--workspace", default=None, help="Workspace FQN (default: USER$<user>.PUBLIC.DEFAULT$)")
+    parser.add_argument("--json", action="store_true", dest="json_only")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--repo-dir", default=None)
+    parser.add_argument("--ci", action="store_true")
     args = parser.parse_args()
-    ci = args.ci
 
     owner, repo, issue_number = parse_issue_url(args.issue)
 
-    # Fetch issue
+    # Determine workspace
+    if args.workspace:
+        workspace = args.workspace
+    else:
+        conn = snowflake.connector.connect(connection_name=args.connection)
+        user = conn.cursor().execute("SELECT CURRENT_USER()").fetchone()[0]
+        conn.close()
+        workspace = f"USER${user}.PUBLIC.DEFAULT$"
+
     if not args.json_only:
         print(f"Fetching issue #{issue_number} from {owner}/{repo}...")
     issue = fetch_issue(owner, repo, issue_number)
 
-    if issue.get("state") == "closed":
-        print(f"  Warning: issue #{issue_number} is already closed.", file=sys.stderr)
-
     if not args.json_only:
         print(f"  Title: {issue['title']}")
-        print(f"  Labels: {', '.join(issue.get('labels', [])) or 'none'}")
 
     # Prepare repo
     if args.repo_dir:
         repo_dir = Path(args.repo_dir)
-        if not repo_dir.exists():
-            print(f"Repo dir does not exist: {repo_dir}", file=sys.stderr)
-            sys.exit(1)
     else:
         repo_dir = prepare_repo(owner, repo, issue_number)
 
-    # Run agent
-    report = asyncio.run(
-        run_healer(issue, issue_number, repo_dir, args.connection, args.json_only)
+    # Upload to workspace
+    upload_to_workspace(repo_dir, workspace, args.connection)
+
+    # Call Managed Agents API
+    if not args.json_only:
+        print(f"\n  Calling Managed Agents API (code_toolset_all)...")
+        print(f"  Workspace: {workspace}")
+        print(f"  Agent runs server-side in Snowflake's managed sandbox.\n")
+
+    prompt = (
+        f"Fix the bug described in this GitHub issue:\n\n"
+        f"**{issue['title']}**\n\n"
+        f"{issue.get('body') or '(no description)'}\n\n"
+        f"The repository is at /workspace/heal/. "
+        f"Investigate the codebase, find the root cause, fix it, and run tests. "
+        f"After fixing, output a JSON block with: pr_title, pr_body, root_cause, confidence (high/medium/low)."
     )
 
-    if not report:
-        print("\nAgent did not produce a structured report.", file=sys.stderr)
-        if ci:
-            gha_output("status", "failed")
-            gha_output("pr-url", "")
-            gha_output("confidence", "")
-        sys.exit(1)
+    report = call_managed_agent(args.connection, workspace, prompt, args.json_only)
 
-    if args.json_only:
-        print(json.dumps(report, indent=2))
-    else:
-        print("\n\nSTRUCTURED REPORT:")
-        print(json.dumps(report, indent=2))
+    # Download fixed files back
+    download_from_workspace(repo_dir, workspace, args.connection)
 
     # Submit PR
     if not args.json_only:
-        print("\nSubmitting PR...")
+        print("\n\nSubmitting PR...")
     pr_url = submit_pr(repo_dir, owner, repo, issue_number, report, args.dry_run)
 
-    confidence = report.get("confidence", "unknown")
+    confidence = (report or {}).get("confidence", "unknown")
 
     if pr_url:
         print(f"\n  PR created: {pr_url}")
-        if ci:
-            gha_output("status", "success")
-            gha_output("pr-url", pr_url)
-            gha_output("confidence", confidence)
-    elif args.dry_run:
-        if ci:
-            gha_output("status", "success")
-            gha_output("pr-url", "dry-run")
-            gha_output("confidence", confidence)
-    else:
-        print("\n  No PR created (no changes or error).", file=sys.stderr)
-        if ci:
-            gha_output("status", "no-changes")
-            gha_output("pr-url", "")
-            gha_output("confidence", confidence)
+    if args.ci:
+        gha_output("status", "success" if pr_url else "no-changes")
+        gha_output("pr-url", pr_url or "")
+        gha_output("confidence", confidence)
 
 
 if __name__ == "__main__":

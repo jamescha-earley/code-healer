@@ -1,8 +1,10 @@
 # Code Healer
 
-Automated bug fixing from GitHub issues using the [Cortex Code Agent SDK](https://docs.snowflake.com/en/developer-guide/cortex-code/cortex-code-agent-sdk).
+Automated bug fixing from GitHub issues using the [Snowflake Managed Agents API](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-coding-agent).
 
-Point it at a GitHub issue. It investigates the codebase, fixes the bug, runs the tests, and submits a PR -- in seconds.
+Point it at a GitHub issue. It calls the Managed Agents API (`code_toolset_all`), which runs a coding agent server-side in Snowflake's managed sandbox. The agent investigates, fixes the bug, runs the tests, and submits a PR.
+
+No CLI install. No local containers. Just a REST call.
 
 ## How it works
 
@@ -10,14 +12,12 @@ Point it at a GitHub issue. It investigates the codebase, fixes the bug, runs th
 python heal.py --issue https://github.com/org/repo/issues/123
 ```
 
-1. Fetches the issue title, body, and labels via `gh api`
+1. Fetches the issue title and body via `gh api`
 2. Clones the repo and creates a `fix/issue-{N}` branch
-3. Launches a Cortex Code agent with a team of three specialists:
-   - **Investigator** (Read, Glob, Grep) -- finds the root cause
-   - **Fixer** (Edit, Write) -- applies the minimal code change
-   - **Reviewer** (Read, Bash) -- validates the fix via `git diff` and tests
-4. Produces a structured JSON report (PR title, body, root cause, confidence)
-5. Commits, pushes, and creates a PR via `gh pr create`
+3. Uploads the repo to a Snowflake workspace
+4. Calls `POST /api/v2/cortex/agent:run` with `code_toolset_all` — Snowflake runs the agent server-side
+5. Agent investigates, fixes, and runs tests in the managed sandbox
+6. Downloads the fixed files, commits, pushes, creates a PR
 
 ## Usage
 
@@ -25,35 +25,26 @@ python heal.py --issue https://github.com/org/repo/issues/123
 # Fix a bug and create a PR
 python heal.py --issue https://github.com/org/repo/issues/42
 
-# Preview the fix without pushing
+# Dry-run (fix but don't push)
 python heal.py --issue https://github.com/org/repo/issues/42 --dry-run
 
-# JSON-only output (for piping)
-python heal.py --issue https://github.com/org/repo/issues/42 --json
-
-# Use an existing local checkout
-python heal.py --issue https://github.com/org/repo/issues/42 --repo-dir ./my-repo
-
-# CI mode (writes GitHub Actions outputs)
-python heal.py --issue https://github.com/org/repo/issues/42 --ci
+# Specify connection and workspace
+python heal.py --issue https://github.com/org/repo/issues/42 \
+  --connection myconn \
+  --workspace 'DB.SCHEMA.MY_WORKSPACE'
 ```
 
 ## GitHub Action
 
-Turn any repo into a self-healing codebase. When someone adds the `heal` label to an issue, the action automatically investigates, fixes, and opens a PR.
+Turn any repo into a self-healing codebase. Label an issue with `heal` and the action fixes it.
 
 ### Setup
 
-**1. Create the workflow file** in your target repo:
-
-```bash
-mkdir -p .github/workflows
-cp workflow.yml .github/workflows/heal.yml
-```
-
-Or copy the contents of `workflow.yml` manually. The key parts:
+Add this workflow to your target repo at `.github/workflows/heal.yml`:
 
 ```yaml
+name: Code Healer
+
 on:
   issues:
     types: [labeled]
@@ -72,28 +63,21 @@ jobs:
         with:
           python-version: '3.12'
       - uses: jamescha-earley/code-healer@main
-        id: healer
         with:
           issue-number: ${{ github.event.issue.number }}
+          snowflake-config: ${{ secrets.SNOWFLAKE_CONNECTIONS_TOML }}
 ```
 
-**2. Create the `heal` label** in your repo (Settings > Labels > New label).
-
-**3. That's it.** Label any issue with `heal` and the action will:
-- Clone the repo
-- Install the Cortex Code CLI and Agent SDK
-- Run the three-agent team (investigate -> fix -> review)
-- Push a fix branch and create a PR
-- Comment on the issue with the result and confidence level
-- Remove the `heal` label to prevent re-triggers
+Add `SNOWFLAKE_CONNECTIONS_TOML` as a repo secret containing your `connections.toml` content.
 
 ### Action inputs
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `issue-number` | Yes | -- | GitHub issue number to fix |
-| `snowflake-connection` | No | `""` | Snowflake connection (for SQL-related bugs) |
-| `cortex-version` | No | `beta` | Cortex Code CLI version channel |
+| `issue-number` | Yes | — | GitHub issue number to fix |
+| `snowflake-connection` | No | `default` | Connection name from connections.toml |
+| `snowflake-config` | No | `""` | Full connections.toml contents (as secret) |
+| `workspace` | No | auto | Workspace FQN for the agent sandbox |
 | `dry-run` | No | `false` | Fix code but skip PR creation |
 
 ### Action outputs
@@ -101,38 +85,40 @@ jobs:
 | Output | Description |
 |--------|-------------|
 | `pr-url` | URL of the created pull request |
-| `status` | `success`, `no-changes`, or `failed` |
-| `confidence` | Agent's confidence: `high`, `medium`, or `low` |
+| `status` | `success` or `no-changes` |
+| `confidence` | Agent confidence: `high`, `medium`, or `low` |
 
-### What happens on failure
+## What's under the hood
 
-If the agent can't fix the bug, it comments on the issue explaining that a human needs to investigate, with a link to the workflow run logs.
+The key API call:
 
-## Project structure
-
+```json
+POST /api/v2/cortex/agent:run
+{
+  "models": {"orchestration": "claude-sonnet-4-5"},
+  "tools": [{"tool_spec": {"type": "code_toolset_all", "name": "code_toolset_all"}}],
+  "tool_resources": {
+    "code_toolset_all": {
+      "permission_policy": {"type": "always_allow"},
+      "workspace_mounts": [{"name": "USER$YOU.PUBLIC.DEFAULT$", "type": "workspace", "mount_path": "/workspace"}]
+    }
+  }
+}
 ```
-heal.py        Main pipeline: fetch issue, clone, fix, submit PR
-agents.py      Three subagent definitions (investigator, fixer, reviewer)
-prompts.py     Orchestrator system prompt built from issue details
-schemas.py     JSON Schema for structured PR output
-action.yml     GitHub Action definition
-workflow.yml   Example workflow for target repos
-```
+
+`code_toolset_all` gives the agent the full CoCo sandbox: bash, file read/write/edit, grep, glob, web search, SQL execution, and skills. Snowflake manages the runtime — you don't host anything.
 
 ## Requirements
 
 - Python 3.12+
-- [Cortex Code CLI](https://docs.snowflake.com/en/developer-guide/cortex-code/cortex-code-overview)
-- [Cortex Code Agent SDK](https://docs.snowflake.com/en/developer-guide/cortex-code/cortex-code-agent-sdk) (`pip install cortex-code-agent-sdk`)
+- `snowflake-connector-python`, `requests`
 - [GitHub CLI](https://cli.github.com/) (`gh`)
+- Snowflake account with Managed Agents API access (Public Preview)
 
-## Example
+## Project structure
 
-Given [this issue](https://github.com/jamescha-earley/heal-test-repo/issues/1) reporting an off-by-one bug in `get_low_stock()`, the agent:
-
-- Found the root cause: `<` instead of `<=` on line 30 of `inventory.py`
-- Applied the one-character fix
-- Ran all 5 tests -- all passing
-- Created [this PR](https://github.com/jamescha-earley/heal-test-repo/pull/3) with full root cause analysis
-
-Total time: **7.8 seconds**. Confidence: **high**.
+```
+heal.py        Pipeline: fetch issue → upload → call API → download → PR
+action.yml     GitHub Action definition
+workflow.yml   Example workflow for target repos
+```

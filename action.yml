@@ -1,5 +1,5 @@
 name: 'Code Healer'
-description: 'Automatically fix bugs from GitHub issues using Cortex Code Agent SDK'
+description: 'Fix bugs from GitHub issues using the Snowflake Managed Agents API (code_toolset_all)'
 author: 'jamescha-earley'
 
 inputs:
@@ -7,19 +7,19 @@ inputs:
     description: 'GitHub issue number to fix'
     required: true
   snowflake-connection:
-    description: 'Snowflake connection name (optional, for SQL-related bugs)'
+    description: 'Snowflake connection name'
+    required: false
+    default: 'default'
+  snowflake-config:
+    description: 'Contents of connections.toml (store as a GitHub secret)'
     required: false
     default: ''
-  cortex-version:
-    description: 'Cortex Code CLI version channel'
-    required: false
-    default: 'beta'
-  snowflake-config:
-    description: 'Full contents of connections.toml for Snowflake auth (store as a GitHub secret)'
+  workspace:
+    description: 'Workspace FQN to mount (default: auto-detect from user)'
     required: false
     default: ''
   dry-run:
-    description: 'If true, fix code but skip PR creation'
+    description: 'Fix code but skip PR creation'
     required: false
     default: 'false'
 
@@ -31,18 +31,12 @@ outputs:
     description: 'Outcome: success, no-changes, or failed'
     value: ${{ steps.heal.outputs.status }}
   confidence:
-    description: 'Agent confidence in the fix: high, medium, or low'
+    description: 'Agent confidence: high, medium, or low'
     value: ${{ steps.heal.outputs.confidence }}
 
 runs:
   using: 'composite'
   steps:
-    - name: Install Cortex Code CLI
-      shell: bash
-      run: |
-        curl -LsS https://ai.snowflake.com/static/cc-scripts/install.sh | CORTEX_CHANNEL=${{ inputs.cortex-version }} sh
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
-
     - name: Configure Snowflake auth
       if: inputs.snowflake-config != ''
       shell: bash
@@ -52,21 +46,10 @@ runs:
         mkdir -p ~/.snowflake
         printf '%s\n' "$SNOWFLAKE_CONFIG_CONTENT" > ~/.snowflake/connections.toml
         chmod 600 ~/.snowflake/connections.toml
-        # Also create config.toml pointing to the default connection
-        CONN_NAME=$(python3 -c "
-        import tomllib
-        with open('$HOME/.snowflake/connections.toml', 'rb') as f:
-            c = tomllib.load(f)
-        print(c.get('default_connection_name', ''))
-        ")
-        if [ -n "$CONN_NAME" ]; then
-          echo "default_connection_name = \"$CONN_NAME\"" > ~/.snowflake/config.toml
-        fi
 
-    - name: Install Python SDK
+    - name: Install dependencies
       shell: bash
-      run: |
-        pip install cortex-code-agent-sdk
+      run: pip install snowflake-connector-python requests
 
     - name: Run Code Healer
       id: heal
@@ -80,6 +63,9 @@ runs:
         ARGS="--issue $ISSUE_URL --ci"
         if [ -n "${{ inputs.snowflake-connection }}" ]; then
           ARGS="$ARGS --connection ${{ inputs.snowflake-connection }}"
+        fi
+        if [ -n "${{ inputs.workspace }}" ]; then
+          ARGS="$ARGS --workspace ${{ inputs.workspace }}"
         fi
         if [ "${{ inputs.dry-run }}" = "true" ]; then
           ARGS="$ARGS --dry-run"
@@ -100,14 +86,10 @@ runs:
         CONFIDENCE="${{ steps.heal.outputs.confidence }}"
 
         if [ "$STATUS" = "success" ]; then
-          BODY="**Code Healer** created a fix: ${PR_URL}\n\nConfidence: **${CONFIDENCE}**\n\n_Automated by [Code Healer](${PR_URL})_"
-        elif [ "$STATUS" = "no-changes" ]; then
-          BODY="**Code Healer** analyzed this issue but could not produce a code fix.\n\n_The agent ran but no file changes were made. A human may need to investigate._"
+          BODY="**Code Healer** created a fix: ${PR_URL}\n\nConfidence: **${CONFIDENCE}**"
         else
-          BODY="**Code Healer** failed to fix this issue.\n\n_Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details._"
+          BODY="**Code Healer** could not fix this issue automatically.\n\nCheck the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details."
         fi
 
         gh issue comment "$ISSUE" --repo "$REPO" --body "$(echo -e "$BODY")"
-
-        # Remove the heal label to prevent re-triggers
         gh issue edit "$ISSUE" --repo "$REPO" --remove-label "heal" || true
