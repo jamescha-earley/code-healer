@@ -110,7 +110,15 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],
-        "model": "claude-sonnet-4-5",
+        "models": {"orchestration": "claude-sonnet-4-5"},
+        "tools": [
+            {"tool_spec": {"type": "code_toolset_all", "name": "code_toolset_all"}}
+        ],
+        "tool_resources": {
+            "code_toolset_all": {
+                "permission_policy": {"type": "always_allow"}
+            }
+        }
     }
 
     headers = {
@@ -122,9 +130,11 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
     response = requests.post(url, json=payload, headers=headers, stream=True)
 
     if response.status_code != 200:
-        print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
+        print(f"API Error {response.status_code}: {response.text[:500]}", file=sys.stderr)
         conn.close()
         return ""
+
+    print(f"  API responded (status {response.status_code})", file=sys.stderr)
 
     full_text = []
     for line in response.iter_lines(decode_unicode=True):
