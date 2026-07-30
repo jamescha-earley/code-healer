@@ -100,7 +100,7 @@ def build_prompt(issue: dict, issue_number: int, files: dict[str, str]) -> str:
 
 
 def call_managed_agent(connection_name: str, prompt: str, json_only: bool = False) -> str:
-    """Call the Managed Agents API with code_toolset_all. Returns full response text."""
+    """Call the Cortex Agents API. Returns full response text."""
     conn = snowflake.connector.connect(connection_name=connection_name)
     token = conn.rest.token
     account_url = f"https://{conn.host}"
@@ -110,15 +110,7 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
         "messages": [
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],
-        "models": {"orchestration": "claude-sonnet-4-5"},
-        "tools": [
-            {"tool_spec": {"type": "code_toolset_all", "name": "code_toolset_all"}}
-        ],
-        "tool_resources": {
-            "code_toolset_all": {
-                "permission_policy": {"type": "always_allow"}
-            }
-        }
+        "model": "claude-sonnet-4-5",
     }
 
     headers = {
