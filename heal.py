@@ -1,13 +1,13 @@
 """Code Healer -- automated bug fixing from GitHub issues.
 
 Calls the Snowflake Managed Agents API (code_toolset_all) to investigate
-and fix bugs. The agent runs server-side in Snowflake's managed sandbox --
-no CLI install, no local containers. Just a REST call.
+and fix bugs. The agent runs server-side in Snowflake's managed sandbox.
+
+No CLI install. No local containers. Pure REST.
 
 Usage:
     python heal.py --issue https://github.com/org/repo/issues/123
     python heal.py --issue https://github.com/org/repo/issues/42 --dry-run
-    python heal.py --issue https://github.com/org/repo/issues/42 --json
 """
 
 import argparse
@@ -37,11 +37,8 @@ def parse_issue_url(url: str) -> tuple[str, str, int]:
 def fetch_issue(owner: str, repo: str, number: int) -> dict:
     """Fetch issue details via gh CLI."""
     result = subprocess.run(
-        [
-            "gh", "api",
-            f"repos/{owner}/{repo}/issues/{number}",
-            "--jq", '{title: .title, body: .body, labels: [.labels[].name], state: .state}',
-        ],
+        ["gh", "api", f"repos/{owner}/{repo}/issues/{number}",
+         "--jq", '{title: .title, body: .body, labels: [.labels[].name], state: .state}'],
         capture_output=True, text=True, check=True,
     )
     return json.loads(result.stdout)
@@ -50,7 +47,6 @@ def fetch_issue(owner: str, repo: str, number: int) -> dict:
 def prepare_repo(owner: str, repo: str, issue_number: int) -> Path:
     """Clone the repo and create a fix branch."""
     repo_dir = Path(tempfile.mkdtemp(prefix=f"heal-{repo}-{issue_number}-"))
-    print(f"  Cloning {owner}/{repo} into {repo_dir}...")
     subprocess.run(
         ["gh", "repo", "clone", f"{owner}/{repo}", str(repo_dir), "--", "--depth=50"],
         check=True, capture_output=True, text=True,
@@ -63,49 +59,48 @@ def prepare_repo(owner: str, repo: str, issue_number: int) -> Path:
     return repo_dir
 
 
-def upload_to_workspace(repo_dir: Path, workspace: str, connection: str) -> None:
-    """Upload repo files to a Snowflake workspace for the managed agent."""
-    print(f"  Uploading repo to workspace {workspace}:/heal/ ...")
-    for f in repo_dir.rglob("*"):
+def read_repo_files(repo_dir: Path) -> dict[str, str]:
+    """Read all source files from the repo (skip .git, binary, large files)."""
+    files = {}
+    for f in sorted(repo_dir.rglob("*")):
         if f.is_file() and ".git" not in f.parts:
-            rel = f.relative_to(repo_dir)
-            dest = f"{workspace}:/heal/{rel.parent}/" if str(rel.parent) != "." else f"{workspace}:/heal/"
-            subprocess.run(
-                ["cortex", "ws", "cp", str(f), dest, "-c", connection],
-                capture_output=True, text=True,
-            )
+            rel = str(f.relative_to(repo_dir))
+            try:
+                content = f.read_text()
+                if len(content) < 50_000:  # skip large files
+                    files[rel] = content
+            except (UnicodeDecodeError, PermissionError):
+                continue
+    return files
 
 
-def download_from_workspace(repo_dir: Path, workspace: str, connection: str) -> None:
-    """Download fixed files back from workspace."""
-    # List all files in workspace heal dir and download them
-    result = subprocess.run(
-        ["cortex", "ws", "ls", f"{workspace}:/heal/", "-c", connection, "--json"],
-        capture_output=True, text=True,
+def build_prompt(issue: dict, issue_number: int, files: dict[str, str]) -> str:
+    """Build the agent prompt with issue details and file contents."""
+    file_section = "\n\n".join(
+        f"--- {path} ---\n```\n{content}\n```"
+        for path, content in files.items()
     )
-    if result.returncode == 0:
-        try:
-            files = json.loads(result.stdout)
-            for entry in files.get("items", []):
-                name = entry.get("name", "")
-                if name:
-                    local_path = repo_dir / name.lstrip("/")
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-                    subprocess.run(
-                        ["cortex", "ws", "cp", f"{workspace}:/heal/{name}", str(local_path.parent) + "/", "-c", connection],
-                        capture_output=True, text=True,
-                    )
-        except json.JSONDecodeError:
-            pass
+
+    return (
+        f"Fix the bug described in issue #{issue_number}:\n\n"
+        f"**{issue['title']}**\n\n"
+        f"{issue.get('body') or '(no description)'}\n\n"
+        f"---\n\n"
+        f"Here are the repository files:\n\n{file_section}\n\n"
+        f"---\n\n"
+        f"Instructions:\n"
+        f"1. Identify the root cause of each failing test\n"
+        f"2. Fix the source files (not the tests)\n"
+        f"3. For each file you fix, output the COMPLETE fixed file content in a fenced code block "
+        f"labeled with the filename, like:\n\n"
+        f"```python:query_builder.py\n# full fixed content\n```\n\n"
+        f"4. After showing fixes, output a JSON block with: "
+        f"pr_title, pr_body, root_cause, confidence (high/medium/low)"
+    )
 
 
-def call_managed_agent(
-    connection_name: str,
-    workspace: str,
-    prompt: str,
-    json_only: bool = False,
-) -> dict | None:
-    """Call the Managed Agents API with code_toolset_all."""
+def call_managed_agent(connection_name: str, prompt: str, json_only: bool = False) -> str:
+    """Call the Managed Agents API with code_toolset_all. Returns full response text."""
     conn = snowflake.connector.connect(connection_name=connection_name)
     token = conn.rest.token
     account_url = f"https://{conn.host}"
@@ -116,22 +111,12 @@ def call_managed_agent(
             {"role": "user", "content": [{"type": "text", "text": prompt}]}
         ],
         "models": {"orchestration": "claude-sonnet-4-5"},
-        "instructions": {
-            "system": (
-                "You are a bug-fixing agent. Investigate the codebase, identify the root cause, "
-                "apply the minimal fix, and run tests to verify. Be thorough but concise. "
-                "After fixing, provide a JSON summary with keys: pr_title, pr_body, root_cause, confidence."
-            )
-        },
         "tools": [
             {"tool_spec": {"type": "code_toolset_all", "name": "code_toolset_all"}}
         ],
         "tool_resources": {
             "code_toolset_all": {
-                "permission_policy": {"type": "always_allow"},
-                "workspace_mounts": [
-                    {"name": workspace, "type": "workspace", "mount_path": "/workspace"}
-                ]
+                "permission_policy": {"type": "always_allow"}
             }
         }
     }
@@ -146,7 +131,8 @@ def call_managed_agent(
 
     if response.status_code != 200:
         print(f"Error {response.status_code}: {response.text}", file=sys.stderr)
-        return None
+        conn.close()
+        return ""
 
     full_text = []
     for line in response.iter_lines(decode_unicode=True):
@@ -166,11 +152,7 @@ def call_managed_agent(
             continue
 
     conn.close()
-
-    # Try to extract structured report from agent output
-    combined = "".join(full_text)
-    report = extract_json_report(combined)
-    return report
+    return "".join(full_text)
 
 
 def extract_text(event: dict) -> str:
@@ -191,15 +173,20 @@ def extract_text(event: dict) -> str:
     return ""
 
 
+def extract_fixed_files(response_text: str) -> dict[str, str]:
+    """Extract fixed file contents from agent response."""
+    files = {}
+    # Match ```python:filename.py or ```filename.py patterns
+    pattern = r'```(?:python)?:?([\w./]+\.py)\n(.*?)```'
+    for match in re.finditer(pattern, response_text, re.DOTALL):
+        filename = match.group(1)
+        content = match.group(2)
+        files[filename] = content
+    return files
+
+
 def extract_json_report(text: str) -> dict | None:
     """Try to find a JSON object with pr_title in the agent output."""
-    # Look for JSON blocks
-    for match in re.finditer(r'\{[^{}]*"pr_title"[^{}]*\}', text, re.DOTALL):
-        try:
-            return json.loads(match.group())
-        except json.JSONDecodeError:
-            continue
-    # Try code-fenced JSON
     for match in re.finditer(r'```json?\s*\n(.*?)\n```', text, re.DOTALL):
         try:
             obj = json.loads(match.group(1))
@@ -207,7 +194,25 @@ def extract_json_report(text: str) -> dict | None:
                 return obj
         except json.JSONDecodeError:
             continue
+    for match in re.finditer(r'\{[^{}]*"pr_title"[^{}]*\}', text, re.DOTALL):
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            continue
     return None
+
+
+def apply_fixes(repo_dir: Path, fixed_files: dict[str, str]) -> int:
+    """Write fixed files back to the repo. Returns number of files changed."""
+    changed = 0
+    for filename, content in fixed_files.items():
+        target = repo_dir / filename
+        if target.exists():
+            original = target.read_text()
+            if original != content:
+                target.write_text(content)
+                changed += 1
+    return changed
 
 
 def submit_pr(
@@ -220,7 +225,6 @@ def submit_pr(
         cwd=repo_dir, capture_output=True, text=True,
     )
     if not status.stdout.strip():
-        print("  No file changes detected.", file=sys.stderr)
         return None
 
     subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True, capture_output=True)
@@ -232,7 +236,8 @@ def submit_pr(
     )
 
     if dry_run:
-        print("\n  [dry-run] Skipping push and PR creation.")
+        diff = subprocess.run(["git", "diff", "HEAD~1", "--stat"], cwd=repo_dir, capture_output=True, text=True)
+        print(f"\n  [dry-run] Changes:\n{diff.stdout}")
         return None
 
     branch = f"fix/issue-{issue_number}"
@@ -267,7 +272,6 @@ def submit_pr(
 
 
 def gha_output(name: str, value: str) -> None:
-    """Write a GitHub Actions output."""
     output_file = os.environ.get("GITHUB_OUTPUT")
     if output_file:
         with open(output_file, "a") as f:
@@ -278,7 +282,6 @@ def main():
     parser = argparse.ArgumentParser(description="Code Healer — fix bugs via Managed Agents API")
     parser.add_argument("--issue", required=True, help="GitHub issue URL")
     parser.add_argument("--connection", default="devrel", help="Snowflake connection name")
-    parser.add_argument("--workspace", default=None, help="Workspace FQN (default: USER$<user>.PUBLIC.DEFAULT$)")
     parser.add_argument("--json", action="store_true", dest="json_only")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--repo-dir", default=None)
@@ -287,19 +290,9 @@ def main():
 
     owner, repo, issue_number = parse_issue_url(args.issue)
 
-    # Determine workspace
-    if args.workspace:
-        workspace = args.workspace
-    else:
-        conn = snowflake.connector.connect(connection_name=args.connection)
-        user = conn.cursor().execute("SELECT CURRENT_USER()").fetchone()[0]
-        conn.close()
-        workspace = f"USER${user}.PUBLIC.DEFAULT$"
-
     if not args.json_only:
         print(f"Fetching issue #{issue_number} from {owner}/{repo}...")
     issue = fetch_issue(owner, repo, issue_number)
-
     if not args.json_only:
         print(f"  Title: {issue['title']}")
 
@@ -309,42 +302,48 @@ def main():
     else:
         repo_dir = prepare_repo(owner, repo, issue_number)
 
-    # Upload to workspace
-    upload_to_workspace(repo_dir, workspace, args.connection)
-
-    # Call Managed Agents API
+    # Read all files
+    files = read_repo_files(repo_dir)
     if not args.json_only:
-        print(f"\n  Calling Managed Agents API (code_toolset_all)...")
-        print(f"  Workspace: {workspace}")
-        print(f"  Agent runs server-side in Snowflake's managed sandbox.\n")
+        print(f"  Files: {len(files)}")
 
-    prompt = (
-        f"Fix the bug described in this GitHub issue:\n\n"
-        f"**{issue['title']}**\n\n"
-        f"{issue.get('body') or '(no description)'}\n\n"
-        f"The repository is at /workspace/heal/. "
-        f"Investigate the codebase, find the root cause, fix it, and run tests. "
-        f"After fixing, output a JSON block with: pr_title, pr_body, root_cause, confidence (high/medium/low)."
-    )
+    # Build prompt and call the API
+    prompt = build_prompt(issue, issue_number, files)
 
-    report = call_managed_agent(args.connection, workspace, prompt, args.json_only)
+    if not args.json_only:
+        print(f"\n  Calling Managed Agents API (code_toolset_all)...\n")
 
-    # Download fixed files back
-    download_from_workspace(repo_dir, workspace, args.connection)
+    response_text = call_managed_agent(args.connection, prompt, args.json_only)
+
+    # Extract fixes and report
+    fixed_files = extract_fixed_files(response_text)
+    report = extract_json_report(response_text)
+
+    if not args.json_only:
+        print(f"\n\n  Fixed files: {list(fixed_files.keys())}")
+        if report:
+            print(f"  Confidence: {report.get('confidence', 'unknown')}")
+
+    # Apply fixes to local repo
+    changed = apply_fixes(repo_dir, fixed_files)
+    if not args.json_only:
+        print(f"  Applied {changed} file changes.")
 
     # Submit PR
-    if not args.json_only:
-        print("\n\nSubmitting PR...")
-    pr_url = submit_pr(repo_dir, owner, repo, issue_number, report, args.dry_run)
-
-    confidence = (report or {}).get("confidence", "unknown")
-
-    if pr_url:
-        print(f"\n  PR created: {pr_url}")
-    if args.ci:
-        gha_output("status", "success" if pr_url else "no-changes")
-        gha_output("pr-url", pr_url or "")
-        gha_output("confidence", confidence)
+    if changed > 0:
+        pr_url = submit_pr(repo_dir, owner, repo, issue_number, report, args.dry_run)
+        if pr_url:
+            print(f"\n  PR: {pr_url}")
+        if args.ci:
+            gha_output("status", "success" if pr_url else "no-changes")
+            gha_output("pr-url", pr_url or "")
+            gha_output("confidence", (report or {}).get("confidence", "unknown"))
+    else:
+        print("  No changes produced.")
+        if args.ci:
+            gha_output("status", "no-changes")
+            gha_output("pr-url", "")
+            gha_output("confidence", "")
 
 
 if __name__ == "__main__":

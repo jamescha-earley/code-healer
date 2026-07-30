@@ -47,7 +47,7 @@ runs:
         printf '%s\n' "$SNOWFLAKE_CONFIG_CONTENT" > ~/.snowflake/connections.toml
         chmod 600 ~/.snowflake/connections.toml
 
-    - name: Install dependencies
+    - name: Install Python dependencies
       shell: bash
       run: pip install snowflake-connector-python requests
 
