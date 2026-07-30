@@ -129,8 +129,15 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
     print(f"  API responded (status {response.status_code})", file=sys.stderr)
 
     full_text = []
+    line_count = 0
     for line in response.iter_lines(decode_unicode=True):
-        if not line or not line.startswith("data: "):
+        if not line:
+            continue
+        line_count += 1
+        # Debug: print first 10 raw SSE lines
+        if line_count <= 10:
+            print(f"  [SSE line {line_count}]: {line[:200]}", file=sys.stderr)
+        if not line.startswith("data: "):
             continue
         data = line[6:]
         if data == "[DONE]":
@@ -143,7 +150,11 @@ def call_managed_agent(connection_name: str, prompt: str, json_only: bool = Fals
                 if not json_only:
                     print(text, end="", flush=True)
         except json.JSONDecodeError:
+            if line_count <= 10:
+                print(f"  [SSE parse error]: {data[:100]}", file=sys.stderr)
             continue
+
+    print(f"\n  [Debug] Total SSE lines: {line_count}, text chunks: {len(full_text)}", file=sys.stderr)
 
     conn.close()
     return "".join(full_text)
